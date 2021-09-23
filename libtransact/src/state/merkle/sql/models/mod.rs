@@ -15,10 +15,28 @@
  * -----------------------------------------------------------------------------
  */
 
+#[cfg(feature = "postgres")]
+pub(in crate::state::merkle::sql) mod postgres;
 #[cfg(feature = "sqlite")]
-mod sqlite;
+pub(in crate::state::merkle::sql) mod sqlite;
 
 use super::schema::*;
+
+#[derive(Insertable, Queryable, Identifiable)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[table_name = "merkle_radix_tree"]
+#[primary_key(id)]
+pub struct MerkleRadixTree {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Insertable)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+#[table_name = "merkle_radix_tree"]
+pub struct NewMerkleRadixTree<'a> {
+    pub name: &'a str,
+}
 
 #[derive(Insertable, Queryable, Identifiable)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -26,6 +44,7 @@ use super::schema::*;
 #[primary_key(id)]
 pub struct MerkleRadixLeaf {
     pub id: i64,
+    pub tree_id: i64,
     pub address: String,
     pub data: Vec<u8>,
 }
@@ -35,51 +54,51 @@ pub struct MerkleRadixLeaf {
 #[table_name = "merkle_radix_leaf"]
 pub struct NewMerkleRadixLeaf<'a> {
     pub id: i64,
+    pub tree_id: i64,
     pub address: &'a str,
     pub data: &'a [u8],
 }
 
-#[derive(Insertable, Queryable, QueryableByName, Identifiable)]
+#[derive(Insertable)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
-#[table_name = "merkle_radix_tree_node"]
-#[primary_key(hash)]
-pub struct MerkleRadixTreeNode {
-    pub hash: String,
-    pub leaf_id: Option<i64>,
-    pub children: Children,
+#[table_name = "merkle_radix_change_log_addition"]
+pub struct NewMerkleRadixChangeLogAddition<'a> {
+    pub tree_id: i64,
+    pub state_root: &'a str,
+    pub parent_state_root: Option<&'a str>,
+    pub addition: &'a str,
 }
 
-#[derive(AsExpression, Debug, FromSqlRow)]
-#[cfg_attr(test, derive(PartialEq))]
-#[cfg_attr(feature = "sqlite", derive(Deserialize, Serialize))]
-#[cfg_attr(feature = "sqlite", sql_type = "diesel::sql_types::Text")]
-pub struct Children(pub Vec<Option<String>>);
-
-#[derive(Insertable, Queryable, Identifiable)]
+#[derive(Queryable, QueryableByName, Identifiable)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
-#[table_name = "merkle_radix_state_root"]
+#[table_name = "merkle_radix_change_log_addition"]
 #[primary_key(id)]
-pub struct MerkleRadixStateRoot {
+pub struct MerkleRadixChangeLogAddition {
     pub id: i64,
+    pub tree_id: i64,
     pub state_root: String,
-    pub parent_state_root: String,
+    pub parent_state_root: Option<String>,
+    pub addition: String,
 }
 
 #[derive(Insertable)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
-#[table_name = "merkle_radix_state_root"]
-pub struct NewMerkleRadixStateRoot<'a> {
+#[table_name = "merkle_radix_change_log_deletion"]
+pub struct NewMerkleRadixChangeLogDeletion<'a> {
+    pub tree_id: i64,
+    pub successor_state_root: &'a str,
     pub state_root: &'a str,
-    pub parent_state_root: &'a str,
+    pub deletion: &'a str,
 }
 
-#[derive(Insertable, Queryable, Identifiable)]
+#[derive(Queryable, QueryableByName, Identifiable)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
-#[table_name = "merkle_radix_state_root_leaf_index"]
+#[table_name = "merkle_radix_change_log_deletion"]
 #[primary_key(id)]
-pub struct MerkleRadixStateRootLeafIndexEntry {
+pub struct MerkleRadixChangeLogDeletion {
     pub id: i64,
-    pub leaf_id: i64,
-    pub from_state_root_id: i64,
-    pub to_state_root_id: Option<i64>,
+    pub tree_id: i64,
+    pub successor_state_root: String,
+    pub state_root: String,
+    pub deletion: String,
 }

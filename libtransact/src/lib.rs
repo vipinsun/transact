@@ -115,9 +115,12 @@
 
 #![cfg_attr(feature = "nightly", feature(test))]
 
-#[cfg(feature = "state-merkle-sql")]
+#[cfg(feature = "diesel")]
 #[macro_use]
 extern crate diesel;
+#[cfg(feature = "diesel_migrations")]
+#[macro_use]
+extern crate diesel_migrations;
 
 #[cfg(feature = "context")]
 pub mod context;

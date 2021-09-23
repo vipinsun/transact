@@ -16,310 +16,116 @@
  */
 
 use diesel::prelude::*;
+use diesel::sql_query;
 
 use crate::error::InternalError;
 
-use crate::state::merkle::sql::schema::{
-    merkle_radix_leaf, merkle_radix_state_root, merkle_radix_state_root_leaf_index,
-};
+use diesel::sql_types::{BigInt, Binary, VarChar};
 
 use super::MerkleRadixOperations;
 
 pub trait MerkleRadixListLeavesOperation {
     fn list_leaves(
         &self,
+        tree_id: i64,
         state_root_hash: &str,
         prefix: Option<&str>,
     ) -> Result<Vec<(String, Vec<u8>)>, InternalError>;
 }
 
-impl<'a, C> MerkleRadixListLeavesOperation for MerkleRadixOperations<'a, C>
-where
-    C: diesel::Connection,
-    i64: diesel::deserialize::FromSql<diesel::sql_types::BigInt, C::Backend>,
-    String: diesel::deserialize::FromSql<diesel::sql_types::Text, C::Backend>,
-    Vec<u8>: diesel::deserialize::FromSql<diesel::sql_types::Blob, C::Backend>,
-{
-    fn list_leaves(
-        &self,
-        state_root_hash: &str,
-        prefix: Option<&str>,
-    ) -> Result<Vec<(String, Vec<u8>)>, InternalError> {
-        self.conn
-            .transaction::<_, diesel::result::Error, _>(|| {
-                let state_root_id = merkle_radix_state_root::table
-                    .filter(merkle_radix_state_root::state_root.eq(state_root_hash))
-                    .select(merkle_radix_state_root::id)
-                    .get_result::<i64>(self.conn)?;
-
-                let mut query = merkle_radix_leaf::table
-                    .inner_join(merkle_radix_state_root_leaf_index::table)
-                    .filter(
-                        merkle_radix_state_root_leaf_index::from_state_root_id
-                            .le(state_root_id)
-                            .and(
-                                merkle_radix_state_root_leaf_index::to_state_root_id
-                                    .is_null()
-                                    .or(merkle_radix_state_root_leaf_index::to_state_root_id
-                                        .gt(state_root_id)),
-                            ),
-                    )
-                    .select((
-                        merkle_radix_leaf::id,
-                        merkle_radix_leaf::address,
-                        merkle_radix_leaf::data,
-                        merkle_radix_state_root_leaf_index::to_state_root_id,
-                    ))
-                    .into_boxed();
-
-                if let Some(prefix) = prefix {
-                    query = query.filter(merkle_radix_leaf::address.like(format!("{}%", prefix)));
-                }
-
-                query = query
-                    .order(merkle_radix_leaf::address.asc())
-                    .then_order_by(merkle_radix_state_root_leaf_index::to_state_root_id.desc());
-
-                let leaves = query
-                    .get_results::<(i64, String, Vec<u8>, Option<i64>)>(self.conn)?
-                    .into_iter()
-                    .map(|(_, addr, data, _)| (addr, data))
-                    .collect();
-
-                Ok(leaves)
-            })
-            .map_err(|e| InternalError::from_source(Box::new(e)))
-    }
+#[derive(QueryableByName)]
+struct Leaf {
+    #[column_name = "address"]
+    #[sql_type = "VarChar"]
+    address: String,
+    #[column_name = "data"]
+    #[sql_type = "Binary"]
+    data: Vec<u8>,
 }
 
 #[cfg(feature = "sqlite")]
-#[cfg(test)]
-mod test {
-    use super::*;
+impl<'a> MerkleRadixListLeavesOperation for MerkleRadixOperations<'a, SqliteConnection> {
+    fn list_leaves(
+        &self,
+        tree_id: i64,
+        state_root_hash: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, Vec<u8>)>, InternalError> {
+        let results = sql_query(
+            r#"
+            WITH RECURSIVE tree_path AS
+            (
+                -- This is the initial node
+                SELECT hash, tree_id, leaf_id, children, 0 as depth
+                FROM merkle_radix_tree_node
+                WHERE hash = ? AND tree_id = ?
 
-    use diesel::dsl::insert_into;
+                UNION ALL
 
-    use crate::state::merkle::sql::migration::sqlite::run_migrations;
-    use crate::state::merkle::sql::models::MerkleRadixLeaf;
-    use crate::state::merkle::sql::operations::update_index::{
-        ChangedLeaf, MerkleRadixUpdateIndexOperation,
-    };
+                -- Recurse through the tree
+                SELECT c.hash, c.tree_id, c.leaf_id, c.children, p.depth + 1
+                FROM merkle_radix_tree_node c, tree_path p, json_each(p.children)
+                WHERE c.hash = json_each.value
+            )
+            SELECT l.address, l.data
+            FROM tree_path t, merkle_radix_leaf l
+            WHERE t.tree_id = ? AND t.leaf_id = l.id AND l.address LIKE ?
+            ORDER BY l.address
+            "#,
+        )
+        .bind::<VarChar, _>(state_root_hash)
+        .bind::<BigInt, _>(tree_id)
+        .bind::<BigInt, _>(tree_id)
+        .bind::<VarChar, _>(format!("{}%", prefix.unwrap_or("")))
+        .load::<Leaf>(self.conn)
+        .map_err(|err| InternalError::from_source(Box::new(err)))?
+        .into_iter()
+        .map(|leaf| (leaf.address, leaf.data))
+        .collect::<Vec<_>>();
 
-    /// This tests that a leaf changed across several state root hashes is included in the list
-    /// at the given state root hash. It verifies that:
-    /// 1. No leaves are returned for the initial state root hash
-    /// 2. The first leaf change is returned for first state root.
-    /// 3. The second leaf change is returned for the second state root.
-    #[test]
-    fn test_list_leaves_at_state_root() -> Result<(), Box<dyn std::error::Error>> {
-        let conn = SqliteConnection::establish(":memory:")?;
-
-        run_migrations(&conn)?;
-
-        let operations = MerkleRadixOperations::new(&conn);
-
-        // insert the initial root:
-        insert_into(merkle_radix_state_root::table)
-            .values((
-                merkle_radix_state_root::state_root.eq("initial-state-root"),
-                merkle_radix_state_root::parent_state_root.eq(""),
-            ))
-            .execute(&conn)?;
-
-        // insert the initial leaf
-        insert_into(merkle_radix_leaf::table)
-            .values(MerkleRadixLeaf {
-                id: 1,
-                address: "aabbcc".into(),
-                data: b"hello".to_vec(),
-            })
-            .execute(&conn)?;
-
-        // update the index
-        operations.update_index(
-            "first-state-root",
-            "initial-state-root",
-            vec![ChangedLeaf::AddedOrUpdated {
-                address: "aabbcc",
-                leaf_id: 1,
-            }],
-        )?;
-
-        // insert the changed leaf
-        insert_into(merkle_radix_leaf::table)
-            .values(MerkleRadixLeaf {
-                id: 2,
-                address: "aabbcc".into(),
-                data: b"goodbye".to_vec(),
-            })
-            .execute(&conn)?;
-
-        operations.update_index(
-            "second-state-root",
-            "first-state-root",
-            vec![ChangedLeaf::AddedOrUpdated {
-                address: "aabbcc",
-                leaf_id: 2,
-            }],
-        )?;
-
-        let leaves = operations.list_leaves("initial-state-root", None)?;
-        assert!(leaves.is_empty());
-
-        let leaves = operations.list_leaves("first-state-root", None)?;
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].0, "aabbcc");
-        assert_eq!(leaves[0].1, b"hello");
-
-        let leaves = operations.list_leaves("second-state-root", None)?;
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].0, "aabbcc");
-        assert_eq!(leaves[0].1, b"goodbye");
-
-        Ok(())
+        Ok(results)
     }
+}
 
-    /// This tests that a leaf inserted then deleted across several state root hashes is included
-    /// in the list only on the state root hash where it exists.  It verifies that:
-    /// 1. No leaves are returned for the initial state root hash
-    /// 2. The leaf is returned for first state root.
-    /// 3. The leaf is no longer returned for the second state root.
-    #[test]
-    fn test_list_leaves_with_deletion() -> Result<(), Box<dyn std::error::Error>> {
-        let conn = SqliteConnection::establish(":memory:")?;
+#[cfg(feature = "postgres")]
+impl<'a> MerkleRadixListLeavesOperation for MerkleRadixOperations<'a, PgConnection> {
+    fn list_leaves(
+        &self,
+        tree_id: i64,
+        state_root_hash: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<(String, Vec<u8>)>, InternalError> {
+        let results = sql_query(
+            r#"
+            WITH RECURSIVE tree_path AS
+            (
+                -- This is the initial node
+                SELECT hash, tree_id, leaf_id, children, 0 as depth
+                FROM merkle_radix_tree_node
+                WHERE hash = $2 AND tree_id = $1
 
-        run_migrations(&conn)?;
+                UNION ALL
 
-        let operations = MerkleRadixOperations::new(&conn);
+                -- Recurse through the tree
+                SELECT c.hash, c.tree_id, c.leaf_id, c.children, p.depth + 1
+                FROM merkle_radix_tree_node c, tree_path p
+                WHERE c.hash = ANY(p.children)
+            )
+            SELECT l.address, l.data
+            FROM tree_path t, merkle_radix_leaf l
+            WHERE t.tree_id = $1 AND t.leaf_id = l.id AND l.address LIKE $3
+            ORDER BY l.address
+            "#,
+        )
+        .bind::<BigInt, _>(tree_id)
+        .bind::<VarChar, _>(state_root_hash)
+        .bind::<VarChar, _>(format!("{}%", prefix.unwrap_or("")))
+        .load::<Leaf>(self.conn)
+        .map_err(|err| InternalError::from_source(Box::new(err)))?
+        .into_iter()
+        .map(|leaf| (leaf.address, leaf.data))
+        .collect::<Vec<_>>();
 
-        // insert the initial root:
-        insert_into(merkle_radix_state_root::table)
-            .values((
-                merkle_radix_state_root::state_root.eq("initial-state-root"),
-                merkle_radix_state_root::parent_state_root.eq(""),
-            ))
-            .execute(&conn)?;
-
-        // insert the initial leaf
-        insert_into(merkle_radix_leaf::table)
-            .values(MerkleRadixLeaf {
-                id: 1,
-                address: "aabbcc".into(),
-                data: b"hello".to_vec(),
-            })
-            .execute(&conn)?;
-
-        // update the index
-        operations.update_index(
-            "first-state-root",
-            "initial-state-root",
-            vec![ChangedLeaf::AddedOrUpdated {
-                address: "aabbcc",
-                leaf_id: 1,
-            }],
-        )?;
-
-        // insert the changed leaf
-        operations.update_index(
-            "second-state-root",
-            "first-state-root",
-            vec![ChangedLeaf::Deleted("aabbcc")],
-        )?;
-
-        let leaves = operations.list_leaves("initial-state-root", None)?;
-        assert!(leaves.is_empty());
-
-        let leaves = operations.list_leaves("first-state-root", None)?;
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].0, "aabbcc");
-        assert_eq!(leaves[0].1, b"hello");
-
-        let leaves = operations.list_leaves("second-state-root", None)?;
-        assert!(leaves.is_empty());
-
-        Ok(())
-    }
-
-    /// This tests that several leaves, added against successive state root hashes.
-    /// 1. Add a leaf and nodes to the tree at state root 1
-    /// 2. Add a second leaf and nodes to the tree at state root 2
-    /// 3. Verify that only the first leaf is returned with state root 1
-    /// 4. Verify that both leaves are returned with state root 2
-    /// 5. Verify that only one of the leaves is included in the list when a subtree is specified
-    #[test]
-    fn test_list_leaves_at_state_root_larger_tree() -> Result<(), Box<dyn std::error::Error>> {
-        let conn = SqliteConnection::establish(":memory:")?;
-
-        run_migrations(&conn)?;
-
-        let operations = MerkleRadixOperations::new(&conn);
-
-        // insert the initial root:
-        insert_into(merkle_radix_state_root::table)
-            .values((
-                merkle_radix_state_root::state_root.eq("initial-state-root"),
-                merkle_radix_state_root::parent_state_root.eq(""),
-            ))
-            .execute(&conn)?;
-
-        // insert the initial leaf
-        insert_into(merkle_radix_leaf::table)
-            .values(MerkleRadixLeaf {
-                id: 1,
-                address: "aabbcc".into(),
-                data: b"hello".to_vec(),
-            })
-            .execute(&conn)?;
-
-        // update the index
-        operations.update_index(
-            "first-state-root",
-            "initial-state-root",
-            vec![ChangedLeaf::AddedOrUpdated {
-                address: "aabbcc",
-                leaf_id: 1,
-            }],
-        )?;
-
-        // insert a new leaf
-        insert_into(merkle_radix_leaf::table)
-            .values(MerkleRadixLeaf {
-                id: 2,
-                address: "112233".into(),
-                data: b"goodbye".to_vec(),
-            })
-            .execute(&conn)?;
-
-        operations.update_index(
-            "second-state-root",
-            "first-state-root",
-            vec![ChangedLeaf::AddedOrUpdated {
-                address: "112233",
-                leaf_id: 2,
-            }],
-        )?;
-
-        let leaves = operations.list_leaves("initial-state-root", None)?;
-        assert!(leaves.is_empty());
-
-        let leaves = operations.list_leaves("first-state-root", None)?;
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].0, "aabbcc");
-        assert_eq!(leaves[0].1, b"hello");
-
-        let leaves = operations.list_leaves("second-state-root", None)?;
-        assert_eq!(leaves.len(), 2);
-        assert_eq!(leaves[0].0, "112233");
-        assert_eq!(leaves[0].1, b"goodbye");
-        assert_eq!(leaves[1].0, "aabbcc");
-        assert_eq!(leaves[1].1, b"hello");
-
-        // Test with a prefix
-        let leaves = operations.list_leaves("second-state-root", Some("aa"))?;
-        assert_eq!(leaves.len(), 1);
-        assert_eq!(leaves[0].0, "aabbcc");
-        assert_eq!(leaves[0].1, b"hello");
-
-        Ok(())
+        Ok(results)
     }
 }

@@ -350,10 +350,7 @@ impl WorkerBuilder {
                                 };
                                 submission_avg = Some(submission_time);
 
-                                let wait_time = match time_to_wait.checked_sub(submission_time) {
-                                    Some(dur) => dur,
-                                    None => time::Duration::from_nanos(0),
-                                };
+                                let wait_time = time_to_wait.saturating_sub(submission_time);
 
                                 thread::sleep(wait_time);
                                 submission_start = time::Instant::now();
@@ -417,7 +414,7 @@ fn slow_rate(
             }
             Err(TryRecvError::Empty) => {
                 // attempt to submit batch again
-                match submit_batch(target, &auth, batch_bytes.clone()) {
+                match submit_batch(target, auth, batch_bytes.clone()) {
                     Ok(()) => break,
                     Err(WorkloadRunnerError::TooManyRequests) => thread::sleep(wait),
                     Err(err) => {
@@ -605,10 +602,7 @@ pub fn submit_batches_from_source(
         };
         submission_avg = Some(submission_time);
 
-        let wait_time = match time_to_wait.checked_sub(submission_time) {
-            Some(dur) => dur,
-            None => time::Duration::from_nanos(0),
-        };
+        let wait_time = time_to_wait.saturating_sub(submission_time);
 
         thread::sleep(wait_time);
         submission_start = time::Instant::now();
